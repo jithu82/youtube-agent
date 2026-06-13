@@ -1,16 +1,14 @@
-from ollama import chat
+import ollama
 from youtube_transcript_api import YouTubeTranscriptApi
 from googleapiclient.discovery import build
 import os
+import chromadb
+import uuid
+client = chromadb.PersistentClient(path="./youtube_rag_db")
+collection = client.get_or_create_collection(name="youtube_data")
 
 
 def search_youtube(query:str,max_searches:int=3) ->list[str] :
-    """
-    this function will search the query in youtube and find the top most videos and returns video id .
-
-    query : the topic that needed to be searched in youtube
-    max_searches: maximum number of videos needed to be returned . default is 3.
-    """
     youtube = build("youtube","v3",developerKey=os.getenv("YOUTUBE_API_KEY"))
     request = youtube.search().list(
         q=query,
@@ -27,15 +25,63 @@ def search_youtube(query:str,max_searches:int=3) ->list[str] :
     
     print("youtube is fetched")
     return videos
-def get_transcript(video_id:str)->str:
+def get_transcript_chunks(video_id:str)->str:
     
     transcript = YouTubeTranscriptApi().fetch(video_id=video_id)
-    text = " ".join(snippet.text for snippet in transcript.snippets)
+    text = str(" ".join(snippet.text for snippet in transcript.snippets))
     print("got transcript")
-    return text
+    chunk_size=1000
+    overlap=200
+    if len(text)<= chunk_size:
+        chunks=[text]
+    else:
+        start = 0
+        chunks = []
+        while start < len(text):
+            end = start+chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start += chunk_size - overlap
+    
+    print("chunks created")
+    for chunk in chunks :
+        embedding = get_embedding(chunk)
+        collection.add(
+            ids=[str(uuid.uuid4())],
+            documents=[chunk],
+            embeddings=[embedding]
+        )
+    print("transcript stored in database")
+
+def get_embedding(text):
+    response = ollama.embeddings(model="nomic-embed-text",prompt=text)
+    return response["embedding"]
+    
+def retreive_chunks(question,n_results=5):
+    print(question)
+    question_embedding = get_embedding(question)
+    response = collection.query(query_embeddings=[question_embedding],n_results=n_results)
+    print("chunks are retreieved")
+    return response["documents"][0]
+
+def ask_rag(question):
+    print("question sent to ask_rag funciton: ",question)
+    chunks = retreive_chunks(question)
+    context = '\n\n'.join(chunks)
+    prompt = f"""
+    answer the question based on the context if the answer is not in the context say you dont know the answer
+    context:
+    {context}
+
+    question:
+    {question}"""
+    ai_response = ollama.chat(model="qwen3:8b",messages=[{"role":"user","content":prompt}])
+    print("rag answered the question")
+    return ai_response["message"]["content"]
 available_functions = {
     "search_youtube": search_youtube,
-    "get_transcript": get_transcript
+    "get_transcript_chunks": get_transcript_chunks,
+    "ask_rag": ask_rag
 }
 messages = []
 tools=[
@@ -55,8 +101,8 @@ tools=[
             },
             "required":["query","max_searches"]
         }}} , {"type":"function","function":{
-        "name":"get_transcript",
-        "description":"get transcript of the youtube video using video id",
+        "name":"get_transcript_chunks",
+        "description":"get transcript of the youtube video using video id and create chunks and store those chunks in database",
         "parameters":{
             "type":"object",
             "properties":{
@@ -65,14 +111,34 @@ tools=[
             }},
             "required":["video_id"]
         }
-        }}]
+        }},
+        {"type":"function",
+         "function":{
+             "name":"ask_rag",
+             "description":"answers a question if the context is stored in vector database and not in the llm's training data",
+             "parameters":{
+                 "type":"object",
+                 "properties":{
+                     "question":{
+                         "type":"string"
+                     }
+                 },"required":["question"]
+             }
+         }}]
 while True:
     user_input = input("You:")
     if user_input == "bye":
         break
+    messages.append({"role":"system","context":"""you are a youtube research agent . you have multiple tools and you should call all those tools whenever required . you should call multiple tools at once .
+                     you can get transcripts of youtube videos using get_transcript_chunks function by sending video id as arguments and this function will create chunks for that transcript and store those chunks in database, 
+                     you can get video id by using search_youtube funciton by sending search query as arguments,
+                     you can find answers to questions which involves data that is not in your training data using ask_rag funciton which retreives relevent chunks from the vector database,
+                     whenever you get a transcipt you should break it into chunks using get_chunks and store in the database using storea_transcipt,so that the user can ask questions which you should answer using ask_rag funciton.
+                     don't answer questions based on the training data answer them using ask_rag or say you dont know the answer """
+    })
     messages.append({'role':"user","content":user_input})
     
-    response = chat(model="qwen3:8b",messages=messages,tools=tools)
+    response = ollama.chat(model="qwen3:8b",messages=messages,tools=tools)
     assistant_message = response["message"]
     if assistant_message.get("tool_calls"):
         messages.append(assistant_message)
@@ -83,7 +149,7 @@ while True:
             print("calling",function)
             result = function(**arguments)
             messages.append({"role":"tool","content":str(result)})
-        final_response = chat(
+        final_response = ollama.chat(
             model="qwen3:8b",
             messages=messages
         )
